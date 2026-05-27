@@ -13,8 +13,9 @@ import requests
 
 NASDAQ_EARNINGS_URL = "https://api.nasdaq.com/api/calendar/earnings"
 ALPHAQUERY_EARNINGS_URL = "https://www.alphaquery.com/stock/{symbol}/earnings-history"
-DEFAULT_EARNINGS_HISTORY_PATH = Path("data/earnings_history.csv")
-DEFAULT_PORTFOLIO_PATH = Path("/Users/rajuaddala/Downloads/portfolio.csv")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_EARNINGS_HISTORY_PATH = PROJECT_ROOT / "data" / "earnings_history.csv"
+DEFAULT_PORTFOLIO_PATH = PROJECT_ROOT / "portfolio.csv"
 PORTFOLIO_SYMBOL_COLUMNS = ["Symbol", "Ticker", "Ticker Symbol", "Holding Ticker", "Security Ticker"]
 NASDAQ_HEADERS = {
     "User-Agent": (

@@ -1,7 +1,12 @@
+
 .DS_Store
 .streamlit.pid
 .streamlit/
 .venv/
+Raju.csv
 __pycache__/
 data/*.csv
 data/earnings_history.csv
+padmaja.csv
+Activity_Gan_Raju_*.xlsx
+Activity_Gan_Padmaja_Rollover_over_*6192_*.xlsx

@@ -1,9 +1,9 @@
 # Gan Portfolio Dashboard
 
-Personal stock dashboard for the Yahoo-style portfolio CSV at:
+Personal stock dashboard for the ticker CSV in this repo:
 
 ```text
-/Users/rajuaddala/Downloads/portfolio.csv
+/Users/rajuaddala/ecp_code/FinViz/portfolio.csv
 ```
 
 ## Features
@@ -68,7 +68,7 @@ To scrape and locally cache the past two years of earnings calendar data for onl
 ./scripts/fetch_earnings_history.py
 ```
 
-The script reads `/Users/rajuaddala/Downloads/portfolio.csv`, checks `data/earnings_history.csv` first, and only scrapes symbols that are not already saved. All tickers are appended into the same local file. Re-running it is safe.
+The script reads `portfolio.csv` from this repo, checks `data/earnings_history.csv` first, and only scrapes symbols that are not already saved. All tickers are appended into the same local file. Re-running it is safe.
 
 When you add a new stock to your portfolio CSV, run:
 

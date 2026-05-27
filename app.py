@@ -3,11 +3,14 @@ from __future__ import annotations
 import math
 import os
 import re
+import zipfile
 from datetime import date, datetime, timedelta
 from html import unescape
+from io import StringIO
 from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import quote
+import xml.etree.ElementTree as ET
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -25,16 +28,23 @@ from earnings_history import (
     scrape_portfolio_earnings_history,
 )
 
-DEFAULT_PORTFOLIO_PATH = Path("/Users/rajuaddala/Downloads/portfolio.csv")
+PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_PORTFOLIO_PATH = PROJECT_ROOT / "portfolio.csv"
+RAJU_COMPARE_PATH = Path("Raju.csv")
+PADMAJA_COMPARE_PATH = Path("padmaja.csv")
+RAJU_ACTIVITY_PATTERN = "Activity_Gan_Raju_*.xlsx"
+PADMAJA_ACTIVITY_PATTERN = "Activity_Gan_Padmaja_Rollover_over_*6192_*.xlsx"
 ADDED_TICKERS_PATH = Path("data/added_tickers.csv")
 DEFAULT_EARNINGS_PATH = Path("earnings.csv")
 POLYGON_AGGS_URL = "https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
+POLYGON_GROUPED_AGGS_URL = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
 POLYGON_PREV_CLOSE_URL = "https://api.polygon.io/v2/aggs/ticker/{symbol}/prev"
 POLYGON_EARNINGS_URL = "https://api.polygon.io/benzinga/v1/earnings"
 POLYGON_TICKER_DETAILS_URL = "https://api.polygon.io/v3/reference/tickers/{symbol}"
 POLYGON_SNAPSHOT_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}"
 FINVIZ_QUOTE_URL = "https://finviz.com/quote.ashx?t={symbol}&p=d"
 MARKETBEAT_EARNINGS_URL = "https://www.marketbeat.com/stocks/{exchange}/{symbol}/earnings/"
+STOOQ_QUOTES_URL = "https://stooq.com/q/l/"
 PERIOD_OPTIONS = {
     "1D": {"days": 3, "multiplier": 5, "timespan": "minute"},
     "5D": {"days": 8, "multiplier": 30, "timespan": "minute"},
@@ -45,7 +55,7 @@ PERIOD_OPTIONS = {
     "5Y": {"days": 365 * 5, "multiplier": 1, "timespan": "week"},
     "MAX": {"days": 365 * 10, "multiplier": 1, "timespan": "month"},
 }
-PAGE_OPTIONS = ["Overview", "Charts", "Patterns", "Day Trade", "Holdings", "Research Notes"]
+PAGE_OPTIONS = ["Overview", "Charts", "Patterns", "Day Trade", "Compare", "Holdings", "Research Notes"]
 MOVING_AVERAGE_WINDOWS = [10, 20, 50, 200]
 NUMERIC_COLUMNS = [
     "Current Price",
@@ -104,6 +114,19 @@ def configured_polygon_api_key(sidebar_api_key: str = "") -> str:
         return str(st.secrets.get("POLYGON_API_KEY", "")).strip()
     except Exception:
         return ""
+
+
+def polygon_error_message(exc: Exception) -> str:
+    response = getattr(exc, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code == 429:
+        return "Polygon rate limit hit. Wait about a minute, then click Refresh local data or reload the chart."
+    if status_code in {401, 403}:
+        return "Polygon rejected this request for the current API plan/key."
+    message = str(exc)
+    if "apiKey=" in message:
+        message = re.sub(r"apiKey=[^&\\s]+", "apiKey=***", message)
+    return message
 
 
 def observed_date(month: int, day: int, year: int) -> date:
@@ -303,6 +326,21 @@ def read_portfolio(uploaded_file: object | None = None, path: Path = DEFAULT_POR
     return df.reset_index(drop=True)
 
 
+def format_file_age(path: Path) -> str:
+    try:
+        modified = datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        return "missing"
+    age = datetime.now() - modified
+    if age.days:
+        return f"{age.days}d old"
+    hours = int(age.total_seconds() // 3600)
+    if hours:
+        return f"{hours}h old"
+    minutes = max(0, int(age.total_seconds() // 60))
+    return f"{minutes}m old"
+
+
 def added_ticker_frame(symbols: list[str]) -> pd.DataFrame:
     rows = []
     for symbol in symbols:
@@ -368,6 +406,92 @@ def merge_added_tickers(portfolio_df: pd.DataFrame) -> pd.DataFrame:
     if portfolio_df.empty:
         return added_df.reset_index(drop=True)
     return pd.concat([portfolio_df, added_df], ignore_index=True, sort=False).reset_index(drop=True)
+
+
+def apply_live_ticker_prices(portfolio_df: pd.DataFrame, api_key: str) -> pd.DataFrame:
+    if portfolio_df.empty or "Symbol" not in portfolio_df.columns:
+        return portfolio_df
+
+    live_df = portfolio_df.copy()
+    symbols = sorted({clean_symbol(symbol) for symbol in live_df["Symbol"].dropna() if clean_symbol(symbol)})
+    if not symbols:
+        return live_df
+
+    live_updates: Dict[str, Dict[str, object]] = {}
+    live_updates.update(fetch_stooq_quotes(symbols))
+
+    grouped_quotes: Dict[str, Dict[str, object]] = {}
+    previous_quotes: Dict[str, Dict[str, object]] = {}
+    market_date = previous_trading_day(date.today())
+    if api_key.strip():
+        try:
+            grouped_quotes = fetch_grouped_daily_quotes(market_date.isoformat(), api_key)
+            if not grouped_quotes and market_date == date.today():
+                market_date = add_trading_days(market_date, -1)
+                grouped_quotes = fetch_grouped_daily_quotes(market_date.isoformat(), api_key)
+            previous_quotes = fetch_grouped_daily_quotes(add_trading_days(market_date, -1).isoformat(), api_key)
+        except RuntimeError:
+            grouped_quotes = {}
+            previous_quotes = {}
+
+    for symbol in symbols:
+        if symbol in live_updates:
+            continue
+        row = grouped_quotes.get(polygon_symbol(symbol))
+        if not row:
+            continue
+        previous_row = previous_quotes.get(polygon_symbol(symbol), {})
+        latest_price = numeric_value(row.get("c"))
+        previous_close = numeric_value(previous_row.get("c"))
+        update: Dict[str, object] = {"Price Source": f"Polygon grouped {market_date.isoformat()}"}
+        if not pd.isna(latest_price):
+            update["Current Price"] = latest_price
+        if not pd.isna(latest_price) and not pd.isna(previous_close):
+            update["Change"] = latest_price - previous_close
+            update["Previous Close"] = previous_close
+        for source_key, target_column in [("o", "Open"), ("h", "High"), ("l", "Low"), ("v", "Volume")]:
+            if row.get(source_key) is not None:
+                update[target_column] = row.get(source_key)
+        if len(update) > 1:
+            live_updates[symbol] = update
+
+    if not live_updates:
+        return live_df
+
+    live_df["Symbol"] = live_df["Symbol"].map(clean_symbol)
+    stale_price_columns = [
+        "Current Price",
+        "Change",
+        "Price Source",
+        "Previous Close",
+        "Open",
+        "High",
+        "Low",
+        "Volume",
+    ]
+    for column in stale_price_columns:
+        if column in live_df.columns:
+            live_df[column] = pd.NA if column == "Price Source" else math.nan
+
+    for symbol, update in live_updates.items():
+        row_mask = live_df["Symbol"] == symbol
+        for column, value in update.items():
+            if column not in live_df.columns:
+                live_df[column] = pd.NA if isinstance(value, str) else math.nan
+            live_df.loc[row_mask, column] = value
+
+    if {"Current Price", "Quantity"}.issubset(live_df.columns):
+        live_df["Market Value"] = live_df["Current Price"].fillna(0) * live_df["Quantity"].fillna(0)
+    if {"Purchase Price", "Quantity"}.issubset(live_df.columns):
+        live_df["Cost Basis"] = live_df["Purchase Price"].fillna(0) * live_df["Quantity"].fillna(0)
+    if {"Market Value", "Cost Basis"}.issubset(live_df.columns):
+        live_df["Gain/Loss"] = live_df["Market Value"].fillna(0) - live_df["Cost Basis"].fillna(0)
+        live_df["Gain/Loss %"] = live_df.apply(
+            lambda row: (row["Gain/Loss"] / row["Cost Basis"] * 100) if row["Cost Basis"] else math.nan,
+            axis=1,
+        )
+
+    return live_df
 
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -474,6 +598,8 @@ def fetch_previous_close(symbol: str, api_key: str) -> float:
         params={"adjusted": "true", "apiKey": api_key},
         timeout=20,
     )
+    if response.status_code == 429:
+        raise RuntimeError("Polygon rate limit hit. Wait about a minute, then refresh.")
     response.raise_for_status()
     payload = response.json()
     results = payload.get("results") or []
@@ -506,6 +632,8 @@ def fetch_chart_data(symbol: str, period_label: str, api_key: str) -> Dict[str, 
         },
         timeout=20,
     )
+    if response.status_code == 429:
+        raise RuntimeError("Polygon rate limit hit. Wait about a minute, then refresh.")
     response.raise_for_status()
     payload = response.json()
     if payload.get("status") not in {"OK", "DELAYED"}:
@@ -666,6 +794,197 @@ def fetch_snapshot_quote(symbol: str, api_key: str) -> Dict[str, object]:
         return {}
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_grouped_daily_quotes(market_date: str, api_key: str) -> Dict[str, Dict[str, object]]:
+    if not api_key.strip() or not market_date:
+        return {}
+    try:
+        response = requests.get(
+            POLYGON_GROUPED_AGGS_URL.format(date=market_date),
+            params={
+                "adjusted": "true",
+                "apiKey": api_key,
+            },
+            timeout=20,
+        )
+        if response.status_code == 429:
+            raise RuntimeError("Polygon rate limit hit. Wait about a minute, then refresh.")
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return {}
+    results = payload.get("results") or []
+    grouped: Dict[str, Dict[str, object]] = {}
+    for row in results:
+        ticker = clean_symbol(row.get("T"))
+        if ticker:
+            grouped[ticker] = row
+    return grouped
+
+
+def stooq_symbol(symbol: str) -> str:
+    cleaned = clean_symbol(symbol)
+    if cleaned == "^IXIC":
+        return "^ndq"
+    if cleaned.startswith("^"):
+        return cleaned.lower()
+    if "." in cleaned:
+        return cleaned.lower()
+    return f"{cleaned.lower()}.us"
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_stooq_quotes(symbols: tuple[str, ...] | list[str]) -> Dict[str, Dict[str, object]]:
+    if not symbols:
+        return {}
+    symbol_lookup = {stooq_symbol(symbol).upper(): clean_symbol(symbol) for symbol in symbols if clean_symbol(symbol)}
+    if not symbol_lookup:
+        return {}
+    try:
+        response = requests.get(
+            STOOQ_QUOTES_URL,
+            params={
+                "s": " ".join(symbol_lookup.keys()).lower(),
+                "f": "sd2t2ohlcv",
+                "h": "",
+                "e": "csv",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+    except Exception:
+        return {}
+
+    try:
+        frame = pd.read_csv(StringIO(response.text))
+    except Exception:
+        return {}
+    if frame.empty or "Symbol" not in frame.columns:
+        return {}
+
+    updates: Dict[str, Dict[str, object]] = {}
+    for _, row in frame.iterrows():
+        raw_symbol = str(row.get("Symbol") or "").strip().upper()
+        original_symbol = symbol_lookup.get(raw_symbol)
+        if not original_symbol:
+            continue
+        latest_price = numeric_value(row.get("Close"))
+        if pd.isna(latest_price):
+            continue
+        quote_time = " ".join(
+            item
+            for item in [str(row.get("Date") or "").strip(), str(row.get("Time") or "").strip()]
+            if item and item.upper() != "N/D"
+        )
+        update: Dict[str, object] = {
+            "Current Price": latest_price,
+            "Price Source": f"Stooq {quote_time}".strip(),
+        }
+        for source_column, target_column in [
+            ("Open", "Open"),
+            ("High", "High"),
+            ("Low", "Low"),
+            ("Volume", "Volume"),
+        ]:
+            value = numeric_value(row.get(source_column))
+            if not pd.isna(value):
+                update[target_column] = value
+        updates[original_symbol] = update
+    return updates
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_latest_aggregate_quote(symbol: str, api_key: str) -> Dict[str, object]:
+    if not api_key.strip():
+        return {}
+    to_date = date.today().isoformat()
+    from_date = (date.today() - timedelta(days=3)).isoformat()
+    encoded_symbol = quote(polygon_symbol(symbol), safe="")
+    try:
+        response = requests.get(
+            POLYGON_AGGS_URL.format(
+                symbol=encoded_symbol,
+                multiplier=5,
+                timespan="minute",
+                from_date=from_date,
+                to_date=to_date,
+            ),
+            params={
+                "adjusted": "true",
+                "sort": "asc",
+                "limit": 50000,
+                "apiKey": api_key,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except Exception:
+        return {}
+    results = payload.get("results") or []
+    if not results:
+        return {}
+
+    frame = pd.DataFrame(
+        {
+            "Datetime": pd.to_datetime([row.get("t") for row in results], unit="ms", utc=True).tz_convert(None),
+            "Open": [row.get("o") for row in results],
+            "High": [row.get("h") for row in results],
+            "Low": [row.get("l") for row in results],
+            "Close": [row.get("c") for row in results],
+            "Volume": [row.get("v") for row in results],
+        }
+    ).dropna(subset=["Datetime", "Close"])
+    if frame.empty:
+        return {}
+
+    latest_trading_date = pd.to_datetime(frame["Datetime"]).dt.date.max()
+    latest_day_df = frame[pd.to_datetime(frame["Datetime"]).dt.date == latest_trading_date].copy()
+    latest_row = latest_day_df.iloc[-1]
+    previous_close = fetch_previous_close(symbol, api_key)
+    latest_price = numeric_value(latest_row.get("Close"))
+    previous_close_number = numeric_value(previous_close)
+    return {
+        "Current Price": latest_price,
+        "Change": latest_price - previous_close_number
+        if not pd.isna(latest_price) and not pd.isna(previous_close_number)
+        else math.nan,
+        "Open": latest_day_df["Open"].dropna().iloc[0] if latest_day_df["Open"].notna().any() else math.nan,
+        "High": latest_day_df["High"].max(),
+        "Low": latest_day_df["Low"].min(),
+        "Volume": latest_day_df["Volume"].sum(),
+        "Previous Close": previous_close,
+        "Price Source": "Polygon aggregate",
+    }
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_latest_ticker_quote(symbol: str, api_key: str) -> Dict[str, object]:
+    snapshot = fetch_snapshot_quote(symbol, api_key)
+    if snapshot:
+        day = snapshot.get("day") if isinstance(snapshot.get("day"), dict) else {}
+        previous_day = snapshot.get("prevDay") if isinstance(snapshot.get("prevDay"), dict) else {}
+        latest_price = numeric_value(snapshot_current_price(snapshot))
+        previous_close = numeric_value(previous_day.get("c"))
+        quote_data: Dict[str, object] = {"Price Source": "Polygon snapshot"}
+        if not pd.isna(latest_price):
+            quote_data["Current Price"] = latest_price
+        if not pd.isna(latest_price) and not pd.isna(previous_close):
+            quote_data["Change"] = latest_price - previous_close
+            quote_data["Previous Close"] = previous_close
+        if day.get("o") is not None:
+            quote_data["Open"] = day.get("o")
+        if day.get("h") is not None:
+            quote_data["High"] = day.get("h")
+        if day.get("l") is not None:
+            quote_data["Low"] = day.get("l")
+        if day.get("v") is not None:
+            quote_data["Volume"] = day.get("v")
+        if len(quote_data) > 1:
+            return quote_data
+    return fetch_latest_aggregate_quote(symbol, api_key)
+
+
 def snapshot_current_price(snapshot: Dict[str, object], fallback: object = math.nan) -> object:
     last_trade = snapshot.get("lastTrade") if isinstance(snapshot, dict) else {}
     day = snapshot.get("day") if isinstance(snapshot, dict) else {}
@@ -796,9 +1115,11 @@ def fetch_earnings_data(symbol: str, api_key: str) -> Dict[str, object]:
 
     cached_history_event = best_cached_earnings_event(symbol, DEFAULT_EARNINGS_HISTORY_PATH)
     if cached_history_event:
+        cached_event_date = earnings_event_date(cached_history_event)
+        cached_kind = "Next" if cached_event_date and cached_event_date > date.today() else "Last"
         return {
             "event": cached_history_event,
-            "kind": "Local",
+            "kind": cached_kind,
             "error": "",
             "source": cached_history_event.get("source", "Local earnings history"),
         }
@@ -932,7 +1253,9 @@ def earnings_label(earnings: Dict[str, object]) -> str:
     if isinstance(event, dict):
         time_value = str(event.get("time") or event.get("time_of_day") or "").strip()
     suffix = f" ({time_value})" if time_value else ""
-    return f"{event_date.isoformat()}{suffix}"
+    kind = str(earnings.get("kind") or "").strip()
+    prefix = f"{kind}: " if kind in {"Last", "Next"} else ""
+    return f"{prefix}{event_date.isoformat()}{suffix}"
 
 
 def add_earnings_marker(
@@ -2452,7 +2775,18 @@ def enable_live_refresh() -> None:
     components.html(
         """
         <script>
-          setTimeout(() => window.parent.location.reload(), 60000);
+          const key = "finviz-scroll-y";
+          const restore = () => {
+            const saved = window.parent.sessionStorage.getItem(key);
+            if (saved !== null) {
+              window.parent.scrollTo(0, Number(saved) || 0);
+            }
+          };
+          restore();
+          setTimeout(() => {
+            window.parent.sessionStorage.setItem(key, String(window.parent.scrollY || 0));
+            window.parent.location.reload();
+          }, 60000);
         </script>
         """,
         height=0,
@@ -2497,12 +2831,19 @@ def render_allocation_chart(df: pd.DataFrame, key: str) -> None:
 
 
 def render_watchlist_table(df: pd.DataFrame) -> None:
+    display_df = df.copy()
+    if "Symbol" in display_df.columns:
+        display_df["Chart"] = display_df["Symbol"].map(
+            lambda symbol: f"?page=Charts&symbol={quote(str(symbol), safe='')}"
+        )
     display_columns = [
         column
         for column in [
+            "Chart",
             "Symbol",
             "Current Price",
             "Change",
+            "Price Source",
             "Open",
             "High",
             "Low",
@@ -2516,11 +2857,14 @@ def render_watchlist_table(df: pd.DataFrame) -> None:
         ]
         if column in df.columns
     ]
+    if "Chart" in display_df.columns and "Chart" not in display_columns:
+        display_columns.insert(0, "Chart")
     st.dataframe(
-        df[display_columns],
+        display_df[display_columns],
         use_container_width=True,
         hide_index=True,
         column_config={
+            "Chart": st.column_config.LinkColumn("Chart", display_text="Open"),
             "Current Price": st.column_config.NumberColumn("Current Price", format="$%.2f"),
             "Change": st.column_config.NumberColumn("Change", format="%.2f"),
             "Open": st.column_config.NumberColumn("Open", format="$%.2f"),
@@ -2534,6 +2878,529 @@ def render_watchlist_table(df: pd.DataFrame) -> None:
             "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%.2f%%"),
         },
     )
+
+
+def comparable_symbol_rows(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    try:
+        df = pd.read_csv(path, encoding="utf-8-sig", index_col=False)
+    except Exception:
+        return pd.DataFrame()
+    if df.empty or "Symbol" not in df.columns:
+        return pd.DataFrame()
+    df.columns = [str(column).strip() for column in df.columns]
+    df = df.copy()
+    df["Symbol"] = df["Symbol"].map(clean_symbol)
+    rename_map = {
+        "Last Price": "Current Price",
+        "Current Value": "Market Value",
+        "Average Cost Basis": "Purchase Price",
+        "Cost Basis Total": "Cost Basis",
+        "Total Gain/Loss Dollar": "Gain/Loss",
+        "Total Gain/Loss Percent": "Gain/Loss %",
+    }
+    for source, target in rename_map.items():
+        if source in df.columns and target not in df.columns:
+            df[target] = df[source]
+    date_acquired_columns = ["Date Acquired", "Acquired Date", "Purchase Date", "Date Purchased", "Open Date"]
+    if "Date Acquired" not in df.columns:
+        source_column = next((column for column in date_acquired_columns if column in df.columns), "")
+        df["Date Acquired"] = df[source_column] if source_column else "-"
+    for column in ["Current Price", "Quantity", "Market Value", "Purchase Price", "Cost Basis", "Gain/Loss", "Gain/Loss %"]:
+        if column in df.columns:
+            df[column] = parse_numeric_series(df[column])
+    df = df[
+        (df["Symbol"] != "")
+        & (~df["Symbol"].str.contains(r"\*", regex=True))
+        & (~df["Symbol"].str.endswith("XX"))
+    ].copy()
+    return df.drop_duplicates(subset=["Symbol"], keep="first").reset_index(drop=True)
+
+
+def xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    try:
+        xml_bytes = archive.read("xl/sharedStrings.xml")
+    except KeyError:
+        return []
+    root = ET.fromstring(xml_bytes)
+    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    values = []
+    for item in root.findall("x:si", namespace):
+        text = "".join(node.text or "" for node in item.findall(".//x:t", namespace))
+        values.append(text)
+    return values
+
+
+def xlsx_cell_value(cell: ET.Element, shared_strings: list[str]) -> str:
+    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    cell_type = cell.attrib.get("t", "")
+    if cell_type == "inlineStr":
+        return "".join(node.text or "" for node in cell.findall(".//x:t", namespace)).strip()
+    value_node = cell.find("x:v", namespace)
+    if value_node is None or value_node.text is None:
+        return ""
+    raw_value = value_node.text.strip()
+    if cell_type == "s":
+        try:
+            return shared_strings[int(raw_value)].strip()
+        except (ValueError, IndexError):
+            return ""
+    return raw_value
+
+
+def xlsx_column_index(cell_ref: str) -> int:
+    letters = re.sub(r"[^A-Z]", "", cell_ref.upper())
+    index = 0
+    for letter in letters:
+        index = index * 26 + ord(letter) - ord("A") + 1
+    return max(index - 1, 0)
+
+
+def read_xlsx_first_sheet(path: Path) -> pd.DataFrame:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            shared_strings = xlsx_shared_strings(archive)
+            worksheet_name = next(
+                name
+                for name in archive.namelist()
+                if name.startswith("xl/worksheets/sheet") and name.endswith(".xml")
+            )
+            root = ET.fromstring(archive.read(worksheet_name))
+    except Exception:
+        return pd.DataFrame()
+
+    namespace = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    rows = []
+    for row in root.findall(".//x:sheetData/x:row", namespace):
+        values = []
+        for cell in row.findall("x:c", namespace):
+            index = xlsx_column_index(cell.attrib.get("r", ""))
+            while len(values) <= index:
+                values.append("")
+            values[index] = xlsx_cell_value(cell, shared_strings)
+        if any(str(value).strip() for value in values):
+            rows.append(values)
+    if not rows:
+        return pd.DataFrame()
+    header_index = next(
+        (
+            index
+            for index, row in enumerate(rows)
+            if {"Date", "Description", "Symbol"}.issubset({str(value).strip() for value in row})
+        ),
+        0,
+    )
+    header = [str(value).strip() for value in rows[header_index]]
+    data_rows = []
+    for row in rows[header_index + 1 :]:
+        padded_row = row + [""] * max(len(header) - len(row), 0)
+        data_rows.append(padded_row[: len(header)])
+    return pd.DataFrame(data_rows, columns=header)
+
+
+def parse_activity_date(value: object) -> pd.Timestamp:
+    if value is None or str(value).strip() == "":
+        return pd.NaT
+    parsed = pd.to_datetime(str(value).strip(), errors="coerce")
+    if pd.notna(parsed):
+        return parsed
+    numeric_value = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(numeric_value):
+        return pd.NaT
+    return pd.to_datetime("1899-12-30") + pd.to_timedelta(float(numeric_value), unit="D")
+
+
+def activity_transactions(pattern: str) -> pd.DataFrame:
+    frames = []
+    for path in sorted(Path(".").glob(pattern)):
+        df = read_xlsx_first_sheet(path)
+        if df.empty or "Symbol" not in df.columns or "Description" not in df.columns:
+            continue
+        df = df.copy()
+        df["Symbol"] = df["Symbol"].map(clean_symbol)
+        df["Description"] = df["Description"].astype(str)
+        description_upper = df["Description"].str.upper()
+        df = df[~description_upper.str.contains("CANCEL", na=False)].copy()
+        df["Action"] = ""
+        df.loc[description_upper.str.contains("YOU BOUGHT", na=False), "Action"] = "Acquired"
+        df.loc[description_upper.str.contains("YOU SOLD", na=False), "Action"] = "Sold"
+        df = df[df["Action"] != ""].copy()
+        if df.empty:
+            continue
+        df["Activity Date"] = df["Date"].map(parse_activity_date) if "Date" in df.columns else pd.NaT
+        if "Price" in df.columns:
+            df["Activity Price"] = parse_numeric_series(df["Price"])
+        else:
+            df["Activity Price"] = pd.NA
+        frames.append(df[["Symbol", "Action", "Activity Date", "Activity Price"]])
+    if not frames:
+        return pd.DataFrame(columns=["Symbol", "Action", "Activity Date", "Activity Price"])
+    activity_df = pd.concat(frames, ignore_index=True)
+    return activity_df[(activity_df["Symbol"] != "") & activity_df["Activity Date"].notna()].copy()
+
+
+def latest_activity_summary(activity_df: pd.DataFrame, account: str) -> pd.DataFrame:
+    acquired_date_column = f"{account} Last Acquired"
+    acquired_price_column = f"{account} Acquired Price"
+    sold_date_column = f"{account} Last Sold"
+    sold_price_column = f"{account} Sold Price"
+    if activity_df.empty:
+        return pd.DataFrame(
+            columns=[
+                "Symbol",
+                acquired_date_column,
+                acquired_price_column,
+                sold_date_column,
+                sold_price_column,
+            ]
+        )
+    rows = []
+    for symbol, symbol_df in activity_df.sort_values("Activity Date").groupby("Symbol"):
+        acquired = symbol_df[symbol_df["Action"] == "Acquired"].tail(1)
+        sold = symbol_df[symbol_df["Action"] == "Sold"].tail(1)
+        acquired_row = acquired.iloc[0] if not acquired.empty else {}
+        sold_row = sold.iloc[0] if not sold.empty else {}
+        rows.append(
+            {
+                "Symbol": symbol,
+                acquired_date_column: acquired_row.get("Activity Date", pd.NaT),
+                acquired_price_column: acquired_row.get("Activity Price", pd.NA),
+                sold_date_column: sold_row.get("Activity Date", pd.NaT),
+                sold_price_column: sold_row.get("Activity Price", pd.NA),
+            }
+        )
+    summary_df = pd.DataFrame(rows)
+    for column in [acquired_date_column, sold_date_column]:
+        summary_df[column] = pd.to_datetime(summary_df[column], errors="coerce").dt.strftime("%Y-%m-%d").fillna("-")
+    return summary_df
+
+
+def attach_account_activity(df: pd.DataFrame, activity_summary: pd.DataFrame, account: str) -> pd.DataFrame:
+    if df.empty or activity_summary.empty:
+        return df
+    merged = df.merge(activity_summary, on="Symbol", how="left")
+    if "Date Acquired" in merged.columns:
+        missing_date = merged["Date Acquired"].astype(str).isin(["", "-", "nan", "NaT"])
+        acquired_date_column = f"{account} Last Acquired"
+        if acquired_date_column in merged.columns:
+            merged.loc[missing_date, "Date Acquired"] = merged.loc[missing_date, acquired_date_column].fillna("-")
+    return merged
+
+
+def compare_date_value(*values: object) -> object:
+    for value in values:
+        if value is None or pd.isna(value):
+            continue
+        text = str(value).strip()
+        if text and text not in {"-", "nan", "NaT"}:
+            return text
+    return "-"
+
+
+def compare_portfolios(raju_df: pd.DataFrame, padmaja_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    raju_symbols = set(raju_df["Symbol"].dropna().map(clean_symbol)) if not raju_df.empty else set()
+    padmaja_symbols = set(padmaja_df["Symbol"].dropna().map(clean_symbol)) if not padmaja_df.empty else set()
+
+    buy_symbols = sorted(padmaja_symbols - raju_symbols)
+    sell_symbols = sorted(raju_symbols - padmaja_symbols)
+    common_symbols = sorted(raju_symbols & padmaja_symbols)
+
+    buy_df = padmaja_df[padmaja_df["Symbol"].isin(buy_symbols)].copy()
+    sell_df = raju_df[raju_df["Symbol"].isin(sell_symbols)].copy()
+    raju_total_value = raju_df["Market Value"].sum(skipna=True) if "Market Value" in raju_df.columns else 0
+    padmaja_total_value = padmaja_df["Market Value"].sum(skipna=True) if "Market Value" in padmaja_df.columns else 0
+
+    common_rows = []
+    for symbol in common_symbols:
+        raju_row = raju_df[raju_df["Symbol"] == symbol].iloc[0].to_dict()
+        padmaja_row = padmaja_df[padmaja_df["Symbol"] == symbol].iloc[0].to_dict()
+        raju_value = raju_row.get("Market Value")
+        padmaja_value = padmaja_row.get("Market Value")
+        common_rows.append(
+            {
+                "Symbol": symbol,
+                "Raju Quantity": raju_row.get("Quantity"),
+                "Padmaja Quantity": padmaja_row.get("Quantity"),
+                "Raju Value": raju_value,
+                "Raju Weight": (raju_value / raju_total_value * 100) if raju_total_value else pd.NA,
+                "Raju Gain/Loss %": raju_row.get("Gain/Loss %"),
+                "Raju Acquired Date": compare_date_value(raju_row.get("Raju Last Acquired"), raju_row.get("Date Acquired")),
+                "Padmaja Value": padmaja_value,
+                "Padmaja Weight": (padmaja_value / padmaja_total_value * 100) if padmaja_total_value else pd.NA,
+                "Padmaja Gain/Loss %": padmaja_row.get("Gain/Loss %"),
+                "Padmaja Acquired Date": compare_date_value(
+                    padmaja_row.get("Padmaja Last Acquired"),
+                    padmaja_row.get("Date Acquired"),
+                ),
+                "Raju Avg Cost": raju_row.get("Purchase Price"),
+                "Padmaja Avg Cost": padmaja_row.get("Purchase Price"),
+            }
+        )
+    return buy_df, sell_df, pd.DataFrame(common_rows)
+
+
+def render_portfolio_compare_table(df: pd.DataFrame, action: str) -> None:
+    if df.empty:
+        st.success(f"No {action} candidates.")
+        return
+    display_columns = [
+        column
+        for column in [
+            "Symbol",
+            "Raju Last Acquired",
+            "Raju Acquired Price",
+            "Raju Last Sold",
+            "Raju Sold Price",
+            "Padmaja Last Acquired",
+            "Padmaja Acquired Price",
+            "Padmaja Last Sold",
+            "Padmaja Sold Price",
+            "Current Price",
+            "Gain/Loss",
+            "Gain/Loss %",
+            "Quantity",
+            "Market Value",
+            "Purchase Price",
+            "Comment",
+        ]
+        if column in df.columns
+    ]
+    display_df = df[display_columns].copy()
+    render_selectable_compare_dataframe(display_df, f"compare_{action}")
+
+
+def all_compare_positions(raju_df: pd.DataFrame, padmaja_df: pd.DataFrame) -> pd.DataFrame:
+    frames = []
+    for account, source_df in [("Raju", raju_df), ("Padmaja", padmaja_df)]:
+        if source_df.empty:
+            continue
+        df = source_df.copy()
+        df["Account"] = account
+        if "Market Value" not in df.columns:
+            df["Market Value"] = pd.NA
+        if "Current Price" not in df.columns:
+            df["Current Price"] = pd.NA
+        if "Quantity" not in df.columns:
+            df["Quantity"] = pd.NA
+        if "Purchase Price" not in df.columns:
+            df["Purchase Price"] = pd.NA
+        account_acquired_price_column = f"{account} Acquired Price"
+        if account_acquired_price_column in df.columns:
+            acquired_price = df[account_acquired_price_column].combine_first(df["Purchase Price"])
+        else:
+            acquired_price = df["Purchase Price"]
+        df["Acquired Price"] = acquired_price
+        for column in ["Current Price", "Acquired Price", "Quantity", "Market Value", "Gain/Loss %"]:
+            if column in df.columns:
+                df[column] = pd.to_numeric(df[column], errors="coerce")
+        missing_market_value = df["Market Value"].isna()
+        df.loc[missing_market_value, "Market Value"] = (
+            df.loc[missing_market_value, "Current Price"] * df.loc[missing_market_value, "Quantity"]
+        )
+        if "Gain/Loss %" not in df.columns:
+            df["Gain/Loss %"] = pd.NA
+        missing_gain_percent = df["Gain/Loss %"].isna() & df["Current Price"].notna() & df["Acquired Price"].gt(0)
+        if missing_gain_percent.any():
+            df.loc[missing_gain_percent, "Gain/Loss %"] = (
+                (df.loc[missing_gain_percent, "Current Price"] - df.loc[missing_gain_percent, "Acquired Price"])
+                / df.loc[missing_gain_percent, "Acquired Price"]
+                * 100
+            )
+        total_value = df["Market Value"].sum(skipna=True)
+        df["% of Total"] = (df["Market Value"] / total_value * 100) if total_value else pd.NA
+        frames.append(
+            df[
+                [
+                    "Account",
+                    "Symbol",
+                    "Current Price",
+                    "Acquired Price",
+                    "Quantity",
+                    "Gain/Loss %",
+                    "Market Value",
+                    "% of Total",
+                ]
+            ]
+        )
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True).sort_values(["Symbol", "Account"]).reset_index(drop=True)
+
+
+def render_selectable_compare_dataframe(df: pd.DataFrame, key: str) -> None:
+    if df.empty:
+        st.info("No rows.")
+        return
+
+    search_text = st.text_input(
+        "Search/filter rows",
+        key=f"{key}_search",
+        placeholder="Type symbol, account, date, etc.",
+    ).strip()
+    display_df = df.copy()
+    if search_text:
+        search_mask = display_df.apply(
+            lambda row: row.astype(str).str.contains(search_text, case=False, na=False).any(),
+            axis=1,
+        )
+        display_df = display_df[search_mask].copy()
+        st.caption(f"Showing {len(display_df)} of {len(df)} rows")
+    display_df = display_df.reset_index(drop=True)
+
+    button_col_1, button_col_2 = st.columns([1, 5])
+    with button_col_1:
+        if st.button("Show selected only", key=f"{key}_show_selected_button"):
+            st.session_state[f"{key}_show_selected_only"] = True
+    with button_col_2:
+        if st.button("Hide selected view", key=f"{key}_hide_selected_button"):
+            st.session_state[f"{key}_show_selected_only"] = False
+
+    selected_rows = []
+    table_state = st.session_state.get(f"{key}_table", {})
+    edited_rows = table_state.get("edited_rows", {}) if isinstance(table_state, dict) else {}
+    for row_index, changes in edited_rows.items():
+        try:
+            row_position = int(row_index)
+        except (TypeError, ValueError):
+            continue
+        if changes.get("Select") and row_position < len(display_df):
+            selected_rows.append(row_position)
+    selected_preview_df = display_df.iloc[selected_rows].copy() if selected_rows else pd.DataFrame()
+
+    if st.session_state.get(f"{key}_show_selected_only", False):
+        if selected_preview_df.empty:
+            st.warning("No rows selected. Check rows in the `Select` column first.")
+        else:
+            st.markdown("**Selected Rows**")
+            st.dataframe(
+                selected_preview_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Current Price": st.column_config.NumberColumn("Current Price", format="$%.2f"),
+                    "Acquired Price": st.column_config.NumberColumn("Acquired Price", format="$%.2f"),
+                    "Purchase Price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
+                    "Market Value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
+                    "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="$%.2f"),
+                    "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%.2f%%"),
+                    "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
+                    "Raju Quantity": st.column_config.NumberColumn("Raju Quantity", format="%.4f"),
+                    "Padmaja Quantity": st.column_config.NumberColumn("Padmaja Quantity", format="%.4f"),
+                    "Raju Value": st.column_config.NumberColumn("Raju Value", format="$%.2f"),
+                    "Padmaja Value": st.column_config.NumberColumn("Padmaja Value", format="$%.2f"),
+                    "Raju Weight": st.column_config.NumberColumn("Raju Weight", format="%.2f%%"),
+                    "Padmaja Weight": st.column_config.NumberColumn("Padmaja Weight", format="%.2f%%"),
+                    "Raju Gain/Loss %": st.column_config.NumberColumn("Raju Gain/Loss %", format="%.2f%%"),
+                    "Padmaja Gain/Loss %": st.column_config.NumberColumn("Padmaja Gain/Loss %", format="%.2f%%"),
+                    "Raju Avg Cost": st.column_config.NumberColumn("Raju Avg Cost", format="$%.2f"),
+                    "Padmaja Avg Cost": st.column_config.NumberColumn("Padmaja Avg Cost", format="$%.2f"),
+                    "% of Total": st.column_config.NumberColumn("% of Total", format="%.2f%%"),
+                    "Raju Acquired Price": st.column_config.NumberColumn("Raju Acquired Price", format="$%.2f"),
+                    "Raju Sold Price": st.column_config.NumberColumn("Raju Sold Price", format="$%.2f"),
+                    "Padmaja Acquired Price": st.column_config.NumberColumn("Padmaja Acquired Price", format="$%.2f"),
+                    "Padmaja Sold Price": st.column_config.NumberColumn("Padmaja Sold Price", format="$%.2f"),
+                },
+            )
+
+    editor_df = display_df.copy()
+    editor_df.insert(0, "Select", False)
+    st.data_editor(
+        editor_df,
+        use_container_width=True,
+        hide_index=True,
+        key=f"{key}_table",
+        disabled=[column for column in editor_df.columns if column != "Select"],
+        column_config={
+            "Select": st.column_config.CheckboxColumn("Select"),
+            "Current Price": st.column_config.NumberColumn("Current Price", format="$%.2f"),
+            "Acquired Price": st.column_config.NumberColumn("Acquired Price", format="$%.2f"),
+            "Purchase Price": st.column_config.NumberColumn("Purchase Price", format="$%.2f"),
+            "Market Value": st.column_config.NumberColumn("Market Value", format="$%.2f"),
+            "Gain/Loss": st.column_config.NumberColumn("Gain/Loss", format="$%.2f"),
+            "Gain/Loss %": st.column_config.NumberColumn("Gain/Loss %", format="%.2f%%"),
+            "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f"),
+            "Raju Quantity": st.column_config.NumberColumn("Raju Quantity", format="%.4f"),
+            "Padmaja Quantity": st.column_config.NumberColumn("Padmaja Quantity", format="%.4f"),
+            "Raju Value": st.column_config.NumberColumn("Raju Value", format="$%.2f"),
+            "Padmaja Value": st.column_config.NumberColumn("Padmaja Value", format="$%.2f"),
+            "Raju Weight": st.column_config.NumberColumn("Raju Weight", format="%.2f%%"),
+            "Padmaja Weight": st.column_config.NumberColumn("Padmaja Weight", format="%.2f%%"),
+            "Raju Gain/Loss %": st.column_config.NumberColumn("Raju Gain/Loss %", format="%.2f%%"),
+            "Padmaja Gain/Loss %": st.column_config.NumberColumn("Padmaja Gain/Loss %", format="%.2f%%"),
+            "Raju Avg Cost": st.column_config.NumberColumn("Raju Avg Cost", format="$%.2f"),
+            "Padmaja Avg Cost": st.column_config.NumberColumn("Padmaja Avg Cost", format="$%.2f"),
+            "% of Total": st.column_config.NumberColumn("% of Total", format="%.2f%%"),
+            "Raju Acquired Price": st.column_config.NumberColumn("Raju Acquired Price", format="$%.2f"),
+            "Raju Sold Price": st.column_config.NumberColumn("Raju Sold Price", format="$%.2f"),
+            "Padmaja Acquired Price": st.column_config.NumberColumn("Padmaja Acquired Price", format="$%.2f"),
+            "Padmaja Sold Price": st.column_config.NumberColumn("Padmaja Sold Price", format="$%.2f"),
+        },
+    )
+
+
+def render_all_compare_positions_table(raju_df: pd.DataFrame, padmaja_df: pd.DataFrame) -> None:
+    positions_df = all_compare_positions(raju_df, padmaja_df)
+    if positions_df.empty:
+        st.info("No positions found.")
+        return
+    render_selectable_compare_dataframe(positions_df, "compare_all_positions")
+
+
+def render_raju_padmaja_compare_page(api_key: str) -> None:
+    st.subheader("Raju vs Padmaja")
+    raju_df = comparable_symbol_rows(RAJU_COMPARE_PATH)
+    padmaja_df = comparable_symbol_rows(PADMAJA_COMPARE_PATH)
+    if raju_df.empty or padmaja_df.empty:
+        st.warning(f"Need `{RAJU_COMPARE_PATH}` and `{PADMAJA_COMPARE_PATH}` in this repo folder.")
+        return
+
+    raju_df = apply_live_ticker_prices(raju_df, api_key)
+    padmaja_df = apply_live_ticker_prices(padmaja_df, api_key)
+    raju_activity_summary = latest_activity_summary(activity_transactions(RAJU_ACTIVITY_PATTERN), "Raju")
+    padmaja_activity_summary = latest_activity_summary(activity_transactions(PADMAJA_ACTIVITY_PATTERN), "Padmaja")
+    raju_df = attach_account_activity(raju_df, raju_activity_summary, "Raju")
+    padmaja_df = attach_account_activity(padmaja_df, padmaja_activity_summary, "Padmaja")
+    buy_df, sell_df, common_df = compare_portfolios(raju_df, padmaja_df)
+    metric_1, metric_2, metric_3, metric_4 = st.columns(4)
+    metric_1.metric("Raju Symbols", len(raju_df))
+    metric_2.metric("Padmaja Symbols", len(padmaja_df))
+    metric_3.metric("Buy Candidates", len(buy_df))
+    metric_4.metric("Sell Candidates", len(sell_df))
+
+    buy_tab, sell_tab, common_tab, all_tab = st.tabs(["Buy For Raju", "Sell From Raju", "In Both", "All Positions"])
+    with buy_tab:
+        st.caption("In Padmaja but not in Raju — buy candidates for Raju.")
+        render_portfolio_compare_table(buy_df.sort_values("Symbol"), "buy")
+    with sell_tab:
+        st.caption("In Raju but not in Padmaja — sell candidates from Raju.")
+        render_portfolio_compare_table(sell_df.sort_values("Symbol"), "sell")
+    with common_tab:
+        if common_df.empty:
+            st.info("No shared symbols.")
+        else:
+            common_display_columns = [
+                "Symbol",
+                "Raju Quantity",
+                "Raju Value",
+                "Raju Weight",
+                "Raju Gain/Loss %",
+                "Raju Acquired Date",
+                "Raju Avg Cost",
+                "Padmaja Quantity",
+                "Padmaja Value",
+                "Padmaja Weight",
+                "Padmaja Gain/Loss %",
+                "Padmaja Acquired Date",
+                "Padmaja Avg Cost",
+            ]
+            common_display_df = common_df[
+                [column for column in common_display_columns if column in common_df.columns]
+            ].sort_values("Symbol")
+            render_selectable_compare_dataframe(common_display_df, "compare_in_both")
+    with all_tab:
+        st.caption("All Raju and Padmaja positions, sorted by symbol. `% of Total` is calculated within each account.")
+        render_all_compare_positions_table(raju_df, padmaja_df)
 
 
 def render_quote_stats_table(
@@ -2551,21 +3418,23 @@ def render_quote_stats_table(
     snapshot_day = snapshot.get("day") if isinstance(snapshot.get("day"), dict) else {}
     snapshot_prev_day = snapshot.get("prevDay") if isinstance(snapshot.get("prevDay"), dict) else {}
     current_price = first_valid_value(
-        quote_record.get("Current Price"),
         snapshot_current_price(snapshot),
+        quote_record.get("Current Price"),
         latest_row.get("Close"),
     )
-    latest_open = first_valid_value(quote_record.get("Open"), snapshot_day.get("o"), latest_row.get("Open"))
-    latest_high = first_valid_value(quote_record.get("High"), snapshot_day.get("h"), latest_row.get("High"))
-    latest_low = first_valid_value(quote_record.get("Low"), snapshot_day.get("l"), latest_row.get("Low"))
-    latest_volume = first_valid_value(quote_record.get("Volume"), snapshot_day.get("v"), latest_row.get("Volume"))
+    latest_open = first_valid_value(snapshot_day.get("o"), quote_record.get("Open"), latest_row.get("Open"))
+    latest_high = first_valid_value(snapshot_day.get("h"), quote_record.get("High"), latest_row.get("High"))
+    latest_low = first_valid_value(snapshot_day.get("l"), quote_record.get("Low"), latest_row.get("Low"))
+    latest_volume = first_valid_value(snapshot_day.get("v"), quote_record.get("Volume"), latest_row.get("Volume"))
     quote_change = numeric_value(quote_record.get("Change"))
     current_price_number = numeric_value(current_price)
-    previous_close = (
+    snapshot_previous_close = first_valid_value(snapshot_prev_day.get("c"), meta.get("chartPreviousClose"))
+    csv_previous_close = (
         current_price_number - quote_change
         if not pd.isna(current_price_number) and not pd.isna(quote_change)
-        else first_valid_value(snapshot_prev_day.get("c"), meta.get("chartPreviousClose"))
+        else math.nan
     )
+    previous_close = first_valid_value(snapshot_previous_close, csv_previous_close)
 
     daily_df = fetch_daily_history(symbol, api_key)
     if daily_df.empty:
@@ -2697,7 +3566,7 @@ def render_price_chart(
     try:
         result = fetch_chart_data(symbol, period_label, api_key)
     except Exception as exc:
-        st.error(f"Could not load chart data for {symbol}: {exc}")
+        st.error(f"Could not load chart data for {symbol}: {polygon_error_message(exc)}")
         return
 
     chart_df = result["data"]
@@ -2716,8 +3585,8 @@ def render_price_chart(
     snapshot = fetch_snapshot_quote(symbol, api_key)
     quote_record = quote_record or {}
     latest_price = first_valid_value(
-        quote_record.get("Current Price"),
         snapshot_current_price(snapshot),
+        quote_record.get("Current Price"),
         chart_df["Close"].dropna().iloc[-1],
     )
     snapshot_prev_day = snapshot.get("prevDay") if isinstance(snapshot.get("prevDay"), dict) else {}
@@ -2735,9 +3604,8 @@ def render_price_chart(
         if not pd.isna(latest_price_number) and not pd.isna(previous_close_number)
         else math.nan
     )
-    latest_change = range_change if period_label != "1D" else first_valid_value(quote_record.get("Change"), fallback_change)
+    latest_change = range_change if period_label != "1D" else first_valid_value(fallback_change, quote_record.get("Change"))
     render_price_header(symbol, latest_price, latest_change, f"{period_label}")
-    enable_live_refresh()
 
     render_quote_stats_table(symbol, chart_df, meta, earnings, api_key, snapshot, quote_record)
 
@@ -2886,10 +3754,33 @@ def main() -> None:
     render_header()
 
     saved_polygon_api_key = configured_polygon_api_key("")
+    portfolio_source_path = DEFAULT_PORTFOLIO_PATH
+    selected_uploaded_file = None
+    auto_refresh_prices = False
     with st.sidebar:
         st.header("Navigation")
         uploaded_file = st.file_uploader("Upload portfolio CSV", type=["csv"])
-        st.caption(f"Default CSV: `{DEFAULT_PORTFOLIO_PATH}`")
+        if uploaded_file is not None:
+            use_uploaded_file = st.checkbox(
+                "Use uploaded portfolio CSV",
+                value=False,
+                help="Leave off to use the FinViz repo portfolio.csv.",
+            )
+            if use_uploaded_file:
+                selected_uploaded_file = uploaded_file
+                st.caption(f"Portfolio source: uploaded `{uploaded_file.name}`")
+            else:
+                st.caption("Uploaded CSV is ignored; using FinViz repo portfolio.csv.")
+        else:
+            st.caption(f"Portfolio source: `{portfolio_source_path}` ({format_file_age(portfolio_source_path)})")
+        if st.button("Refresh local data", key="refresh_local_data"):
+            st.cache_data.clear()
+            st.rerun()
+        auto_refresh_prices = st.checkbox(
+            "Auto-refresh prices",
+            value=False,
+            help="Reloads the page during market hours. Keep this off to preserve your current view.",
+        )
         if saved_polygon_api_key:
             st.success("Polygon.io API key loaded from local secrets.")
         else:
@@ -2903,10 +3794,13 @@ def main() -> None:
         )
 
     polygon_api_key = configured_polygon_api_key(sidebar_polygon_key) or saved_polygon_api_key
-    portfolio_df = merge_added_tickers(read_portfolio(uploaded_file=uploaded_file))
+    portfolio_df = merge_added_tickers(read_portfolio(uploaded_file=selected_uploaded_file, path=portfolio_source_path))
     if portfolio_df.empty:
         st.warning("No portfolio rows found. Upload a Yahoo-style portfolio CSV or add a ticker to continue.")
         return
+    portfolio_df = apply_live_ticker_prices(portfolio_df, polygon_api_key)
+    if polygon_api_key and auto_refresh_prices:
+        enable_live_refresh()
 
     with st.sidebar:
         query_page = st.query_params.get("page", "Overview")
@@ -2935,7 +3829,8 @@ def main() -> None:
         if selected_symbol and selected_symbol not in symbols:
             if ticker_exists(selected_symbol, polygon_api_key):
                 save_added_ticker(selected_symbol)
-                portfolio_df = merge_added_tickers(read_portfolio(uploaded_file=uploaded_file))
+                portfolio_df = merge_added_tickers(read_portfolio(uploaded_file=selected_uploaded_file, path=portfolio_source_path))
+                portfolio_df = apply_live_ticker_prices(portfolio_df, polygon_api_key)
                 symbols = portfolio_df["Symbol"].dropna().astype(str).tolist()
                 st.success(f"Added {selected_symbol}")
             else:
@@ -2943,11 +3838,29 @@ def main() -> None:
                 selected_symbol = symbols[default_symbol_index]
         if selected_symbol and selected_symbol in symbols:
             st.query_params["symbol"] = selected_symbol
-        period_label = st.radio("Range", list(PERIOD_OPTIONS.keys()), index=3, horizontal=False)
-        chart_type = st.radio("Chart", ["Line", "Candlestick"], horizontal=False)
+        query_range = str(st.query_params.get("range", "6M"))
+        range_options = list(PERIOD_OPTIONS.keys())
+        default_range_index = range_options.index(query_range) if query_range in range_options else range_options.index("6M")
+        period_label = st.radio("Range", range_options, index=default_range_index, horizontal=False, key="selected_range")
+        st.query_params["range"] = period_label
+        chart_options = ["Line", "Candlestick"]
+        query_chart = str(st.query_params.get("chart", "Line"))
+        default_chart_index = chart_options.index(query_chart) if query_chart in chart_options else 0
+        chart_type = st.radio("Chart", chart_options, index=default_chart_index, horizontal=False, key="selected_chart")
+        st.query_params["chart"] = chart_type
         st.divider()
         manual_earnings_event = None
-        search_text = st.text_input("Search portfolio", placeholder="symbol, comment, price...")
+        query_search = str(st.query_params.get("search", ""))
+        search_text = st.text_input(
+            "Search portfolio",
+            value=query_search,
+            placeholder="symbol, comment, price...",
+            key="portfolio_search",
+        )
+        if search_text.strip():
+            st.query_params["search"] = search_text.strip()
+        elif "search" in st.query_params:
+            del st.query_params["search"]
 
     filtered_df = filter_symbols(portfolio_df, search_text)
 
@@ -2978,6 +3891,9 @@ def main() -> None:
 
     elif selected_page == "Day Trade":
         render_day_trade_page(symbols, polygon_api_key)
+
+    elif selected_page == "Compare":
+        render_raju_padmaja_compare_page(polygon_api_key)
 
     elif selected_page == "Holdings":
         st.subheader("Holdings And Gain/Loss")
