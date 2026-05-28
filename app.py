@@ -42,6 +42,7 @@ POLYGON_PREV_CLOSE_URL = "https://api.polygon.io/v2/aggs/ticker/{symbol}/prev"
 POLYGON_EARNINGS_URL = "https://api.polygon.io/benzinga/v1/earnings"
 POLYGON_TICKER_DETAILS_URL = "https://api.polygon.io/v3/reference/tickers/{symbol}"
 POLYGON_SNAPSHOT_URL = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/tickers/{symbol}"
+YAHOO_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 FINVIZ_QUOTE_URL = "https://finviz.com/quote.ashx?t={symbol}&p=d"
 MARKETBEAT_EARNINGS_URL = "https://www.marketbeat.com/stocks/{exchange}/{symbol}/earnings/"
 STOOQ_QUOTES_URL = "https://stooq.com/q/l/"
@@ -102,6 +103,13 @@ def polygon_symbol(symbol: str) -> str:
     if cleaned.startswith("^"):
         cleaned = cleaned[1:]
     return cleaned.replace("/", ".")
+
+
+def yahoo_symbol(symbol: str) -> str:
+    cleaned = clean_symbol(symbol)
+    if cleaned == "^IXIC":
+        return "^IXIC"
+    return cleaned.replace(".", "-").replace("/", "-")
 
 
 def configured_polygon_api_key(sidebar_api_key: str = "") -> str:
@@ -608,6 +616,104 @@ def fetch_previous_close(symbol: str, api_key: str) -> float:
     return float(results[0].get("c", math.nan))
 
 
+def yahoo_chart_options(period_label: str) -> Dict[str, str]:
+    return {
+        "1D": {"range": "5d", "interval": "5m"},
+        "5D": {"range": "5d", "interval": "30m"},
+        "1M": {"range": "1mo", "interval": "1d"},
+        "6M": {"range": "6mo", "interval": "1d"},
+        "YTD": {"range": "ytd", "interval": "1d"},
+        "1Y": {"range": "1y", "interval": "1d"},
+        "5Y": {"range": "5y", "interval": "1wk"},
+        "MAX": {"range": "10y", "interval": "1mo"},
+    }.get(period_label, {"range": "6mo", "interval": "1d"})
+
+
+def previous_close_from_prior_chart_date(frame: pd.DataFrame) -> float:
+    if frame.empty or not {"Datetime", "Close"}.issubset(frame.columns):
+        return math.nan
+    close_df = frame.dropna(subset=["Datetime", "Close"]).copy()
+    if close_df.empty:
+        return math.nan
+    close_df["Chart Date"] = pd.to_datetime(close_df["Datetime"]).dt.date
+    latest_chart_date = close_df["Chart Date"].max()
+    prior_dates = sorted(date_value for date_value in close_df["Chart Date"].unique() if date_value < latest_chart_date)
+    if not prior_dates:
+        return math.nan
+    prior_day_df = close_df[close_df["Chart Date"] == prior_dates[-1]]
+    if prior_day_df.empty:
+        return math.nan
+    return numeric_value(prior_day_df.sort_values("Datetime")["Close"].iloc[-1])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_yahoo_chart_data(symbol: str, period_label: str) -> Dict[str, object]:
+    option = yahoo_chart_options(period_label)
+    encoded_symbol = quote(yahoo_symbol(symbol), safe="")
+    response = requests.get(
+        YAHOO_CHART_URL.format(symbol=encoded_symbol),
+        params={
+            "range": option["range"],
+            "interval": option["interval"],
+            "includePrePost": "false",
+            "events": "history",
+        },
+        timeout=20,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart") if isinstance(payload, dict) else {}
+    error = chart.get("error") if isinstance(chart, dict) else None
+    if error:
+        raise RuntimeError(error.get("description") or error.get("code") or "Yahoo chart request failed.")
+    results = chart.get("result") or []
+    if not results:
+        raise RuntimeError(f"No Yahoo chart bars returned for {symbol}.")
+
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    quote_blocks = result.get("indicators", {}).get("quote") or []
+    quote_block = quote_blocks[0] if quote_blocks else {}
+    if not timestamps or not quote_block:
+        raise RuntimeError(f"No Yahoo chart bars returned for {symbol}.")
+
+    frame = pd.DataFrame(
+        {
+            "Datetime": pd.to_datetime(timestamps, unit="s", utc=True).tz_convert(None),
+            "Open": quote_block.get("open") or [],
+            "High": quote_block.get("high") or [],
+            "Low": quote_block.get("low") or [],
+            "Close": quote_block.get("close") or [],
+            "Volume": quote_block.get("volume") or [],
+        }
+    )
+    frame = frame.dropna(subset=["Datetime", "Close"]).reset_index(drop=True)
+    if frame.empty:
+        raise RuntimeError(f"No Yahoo chart bars returned for {symbol}.")
+    previous_close = previous_close_from_prior_chart_date(frame)
+    if period_label == "1D" and not frame.empty:
+        latest_trading_date = pd.to_datetime(frame["Datetime"]).dt.date.max()
+        frame = frame[pd.to_datetime(frame["Datetime"]).dt.date == latest_trading_date].reset_index(drop=True)
+
+    meta_payload = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+    meta = {
+        "currency": meta_payload.get("currency", "USD"),
+        "exchangeName": meta_payload.get("exchangeName", "Yahoo Finance"),
+        "regularMarketPrice": first_valid_value(meta_payload.get("regularMarketPrice"), frame["Close"].dropna().iloc[-1]),
+        "chartPreviousClose": first_valid_value(
+            previous_close,
+            meta_payload.get("previousClose"),
+            frame["Close"].dropna().iloc[0],
+        ),
+        "source": "Yahoo Finance fallback",
+        "from": str(frame["Datetime"].min().date()),
+        "to": str(frame["Datetime"].max().date()),
+        "timespan": "minute" if option["interval"].endswith("m") else "day",
+        "multiplier": option["interval"],
+    }
+    return {"data": frame, "meta": meta}
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_chart_data(symbol: str, period_label: str, api_key: str) -> Dict[str, object]:
     if not api_key.strip():
@@ -633,7 +739,7 @@ def fetch_chart_data(symbol: str, period_label: str, api_key: str) -> Dict[str, 
         timeout=20,
     )
     if response.status_code == 429:
-        raise RuntimeError("Polygon rate limit hit. Wait about a minute, then refresh.")
+        return fetch_yahoo_chart_data(symbol, period_label)
     response.raise_for_status()
     payload = response.json()
     if payload.get("status") not in {"OK", "DELAYED"}:
@@ -655,10 +761,15 @@ def fetch_chart_data(symbol: str, period_label: str, api_key: str) -> Dict[str, 
         }
     )
     frame = frame.dropna(subset=["Datetime", "Close"]).reset_index(drop=True)
+    previous_close = previous_close_from_prior_chart_date(frame)
     if period_label == "1D" and not frame.empty:
         latest_trading_date = pd.to_datetime(frame["Datetime"]).dt.date.max()
         frame = frame[pd.to_datetime(frame["Datetime"]).dt.date == latest_trading_date].reset_index(drop=True)
-    previous_close = fetch_previous_close(symbol, api_key)
+    if pd.isna(previous_close):
+        try:
+            previous_close = fetch_previous_close(symbol, api_key)
+        except RuntimeError:
+            previous_close = frame["Close"].dropna().iloc[0] if not frame.empty else math.nan
     meta = {
         "currency": "USD",
         "exchangeName": "Polygon.io",
@@ -1269,12 +1380,17 @@ def add_earnings_marker(
         return
 
     event_timestamp = pd.Timestamp(event_date)
-    event_datetime = event_timestamp.to_pydatetime()
-    min_chart_time = pd.to_datetime(chart_df["Datetime"]).min()
-    max_chart_time = pd.to_datetime(chart_df["Datetime"]).max()
+    chart_times = pd.to_datetime(chart_df["Datetime"])
+    event_day_df = chart_df[chart_times.dt.date == event_date].copy()
+    event_datetime = (
+        pd.to_datetime(event_day_df["Datetime"]).min().to_pydatetime()
+        if not event_day_df.empty
+        else event_timestamp.to_pydatetime()
+    )
     label = earnings_label(earnings)
     price_column = "High" if "High" in chart_df.columns else "Close"
-    marker_y = pd.to_numeric(chart_df[price_column], errors="coerce").max()
+    marker_source_df = event_day_df if not event_day_df.empty else chart_df
+    marker_y = pd.to_numeric(marker_source_df[price_column], errors="coerce").max()
 
     fig.add_shape(
         type="line",
@@ -1298,6 +1414,16 @@ def add_earnings_marker(
                 hovertemplate=f"{label}<extra></extra>",
             )
         )
+    fig.add_annotation(
+        x=event_datetime,
+        y=1,
+        xref="x",
+        yref="paper",
+        text="Earnings",
+        showarrow=False,
+        yshift=12,
+        font={"color": "#f97316", "size": 11},
+    )
 
 
 def earnings_events_for_chart(
@@ -1814,11 +1940,26 @@ def visible_daily_history(symbol: str, chart_df: pd.DataFrame, api_key: str) -> 
         ma_df = fetch_daily_history(symbol, api_key)
     except Exception:
         return pd.DataFrame()
-    if ma_df.empty:
+    if ma_df.empty or chart_df.empty or "Datetime" not in chart_df.columns:
         return pd.DataFrame()
 
     min_chart_time = pd.to_datetime(chart_df["Datetime"]).min()
     max_chart_time = pd.to_datetime(chart_df["Datetime"]).max()
+    chart_times = pd.to_datetime(chart_df["Datetime"])
+    is_intraday_chart = (chart_times.dt.normalize() != chart_times).any()
+    if is_intraday_chart:
+        daily_df = ma_df.sort_values("Datetime").copy()
+        daily_df["Chart Date"] = pd.to_datetime(daily_df["Datetime"]).dt.normalize()
+        intraday_df = chart_df[["Datetime"]].dropna().sort_values("Datetime").copy()
+        intraday_df["Chart Date"] = pd.to_datetime(intraday_df["Datetime"]).dt.normalize()
+        projected_ma_df = pd.merge_asof(
+            intraday_df,
+            daily_df.drop(columns=["Datetime"]).sort_values("Chart Date"),
+            on="Chart Date",
+            direction="backward",
+        ).drop(columns=["Chart Date"])
+        return projected_ma_df.dropna(subset=["Datetime"]).reset_index(drop=True)
+
     visible_ma_df = ma_df[
         (pd.to_datetime(ma_df["Datetime"]) >= min_chart_time)
         & (pd.to_datetime(ma_df["Datetime"]) <= max_chart_time)
@@ -1852,6 +1993,7 @@ def add_moving_average_lines(
                 mode="lines",
                 name=f"{window}D MA",
                 line={"width": 1.8, "color": colors.get(window)},
+                connectgaps=True,
             )
         )
 
@@ -3428,7 +3570,7 @@ def render_quote_stats_table(
     latest_volume = first_valid_value(snapshot_day.get("v"), quote_record.get("Volume"), latest_row.get("Volume"))
     quote_change = numeric_value(quote_record.get("Change"))
     current_price_number = numeric_value(current_price)
-    snapshot_previous_close = first_valid_value(snapshot_prev_day.get("c"), meta.get("chartPreviousClose"))
+    snapshot_previous_close = first_valid_value(meta.get("chartPreviousClose"), snapshot_prev_day.get("c"))
     csv_previous_close = (
         current_price_number - quote_change
         if not pd.isna(current_price_number) and not pd.isna(quote_change)
@@ -3440,6 +3582,7 @@ def render_quote_stats_table(
     if daily_df.empty:
         avg_volume = math.nan
         week_52_range = "-"
+        latest_ma_values = {window: math.nan for window in MOVING_AVERAGE_WINDOWS}
     else:
         avg_volume = pd.to_numeric(daily_df["Volume"], errors="coerce").tail(30).mean() if "Volume" in daily_df.columns else math.nan
         recent_year_df = daily_df.tail(min(len(daily_df), 252))
@@ -3448,6 +3591,13 @@ def render_quote_stats_table(
             if {"Low", "High"}.issubset(recent_year_df.columns)
             else "-"
         )
+        latest_ma_row = daily_df.dropna(subset=["Datetime"]).sort_values("Datetime").tail(1)
+        latest_ma_values = {
+            window: numeric_value(latest_ma_row[f"MA{window}"].iloc[0])
+            if not latest_ma_row.empty and f"MA{window}" in latest_ma_row.columns
+            else math.nan
+            for window in MOVING_AVERAGE_WINDOWS
+        }
 
     ticker_details = fetch_ticker_details(symbol, api_key)
     fundamentals = fetch_fundamentals(symbol)
@@ -3465,6 +3615,10 @@ def render_quote_stats_table(
         ("EPS (TTM)", fundamentals.get("eps_ttm", "-")),
         ("Beta", fundamentals.get("beta", "-")),
         ("1Y Target Est", fundamentals.get("target_price", "-")),
+        ("MA10", format_money(latest_ma_values.get(10))),
+        ("MA20", format_money(latest_ma_values.get(20))),
+        ("MA50", format_money(latest_ma_values.get(50))),
+        ("MA200", format_money(latest_ma_values.get(200))),
     ]
 
     cells = "".join(
@@ -3590,21 +3744,15 @@ def render_price_chart(
         chart_df["Close"].dropna().iloc[-1],
     )
     snapshot_prev_day = snapshot.get("prevDay") if isinstance(snapshot.get("prevDay"), dict) else {}
-    previous_close = first_valid_value(snapshot_prev_day.get("c"), meta.get("chartPreviousClose"))
+    previous_close = first_valid_value(meta.get("chartPreviousClose"), snapshot_prev_day.get("c"))
     latest_price_number = numeric_value(latest_price)
     previous_close_number = numeric_value(previous_close)
-    range_start_price = numeric_value(chart_df["Close"].dropna().iloc[0])
-    range_change = (
-        latest_price_number - range_start_price
-        if not pd.isna(latest_price_number) and not pd.isna(range_start_price)
-        else math.nan
-    )
     fallback_change = (
         latest_price_number - previous_close_number
         if not pd.isna(latest_price_number) and not pd.isna(previous_close_number)
         else math.nan
     )
-    latest_change = range_change if period_label != "1D" else first_valid_value(fallback_change, quote_record.get("Change"))
+    latest_change = first_valid_value(fallback_change, quote_record.get("Change"))
     render_price_header(symbol, latest_price, latest_change, f"{period_label}")
 
     render_quote_stats_table(symbol, chart_df, meta, earnings, api_key, snapshot, quote_record)
@@ -3649,7 +3797,7 @@ def render_price_chart(
         fig.update_layout(title=f"{symbol} Price Chart", xaxis_rangeslider_visible=False)
     else:
         fig = px.line(chart_df, x="Datetime", y="Close", title=f"{symbol} Close Price")
-        fig.update_traces(line_width=2.4)
+        fig.update_traces(line_width=2.4, connectgaps=True)
 
     visible_ma_df = visible_daily_history(symbol, chart_df, api_key)
     add_moving_average_lines(fig, visible_ma_df, selected_ma_windows)
@@ -3838,9 +3986,9 @@ def main() -> None:
                 selected_symbol = symbols[default_symbol_index]
         if selected_symbol and selected_symbol in symbols:
             st.query_params["symbol"] = selected_symbol
-        query_range = str(st.query_params.get("range", "6M"))
+        query_range = str(st.query_params.get("range", "1D"))
         range_options = list(PERIOD_OPTIONS.keys())
-        default_range_index = range_options.index(query_range) if query_range in range_options else range_options.index("6M")
+        default_range_index = range_options.index(query_range) if query_range in range_options else range_options.index("1D")
         period_label = st.radio("Range", range_options, index=default_range_index, horizontal=False, key="selected_range")
         st.query_params["range"] = period_label
         chart_options = ["Line", "Candlestick"]
